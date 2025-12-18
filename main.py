@@ -89,8 +89,7 @@ for eta in step_sizes:
                 print(f"[eta={eta}] iter {t}/{T}  acc={correct:.4f}")
 
         # full-batch GD step
-        g = grad_logistic(v, X, y)
-        v = v - eta * g
+        gd_step(v, X, X_T, y, eta)
 
     histories[eta] = (iter_list, acc_list)
 
