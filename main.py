@@ -66,22 +66,31 @@ def accuracy(v, X, y):
 # ---------------------- training loop ---------------------- #
 
 step_sizes = [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0]
-T = 5000
+T = 300000
 eval_every = 1000
 
 histories = {}
 
 for eta in step_sizes:
+    print(f"\n=== Step size {eta} ===")
     v = torch.zeros(d, device=device)
     acc_list = []
     iter_list = []
 
     for t in range(T + 1):
+        # evaluate accuracy
         if t % eval_every == 0:
-            acc_list.append(accuracy(v, X, y))
-            iter_list.append(t)
+            with torch.no_grad():
+                logits = X @ v
+                preds = torch.sign(logits)
+                correct = (preds == y).float().mean().item()
+                acc_list.append(correct)
+                iter_list.append(t)
+                print(f"[eta={eta}] iter {t}/{T}  acc={correct:.4f}")
 
-        gd_step(v, X, X_T, y, eta)
+        # full-batch GD step
+        g = grad_logistic(v, X, y)
+        v = v - eta * g
 
     histories[eta] = (iter_list, acc_list)
 
