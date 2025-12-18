@@ -25,9 +25,14 @@ idx1_sub = rng.choice(idx1, size=2500, replace=False)
 indices = np.concatenate([idx0_sub, idx1_sub])
 subset = Subset(trainset, indices)
 
-loader = DataLoader(subset, batch_size=len(subset), shuffle=False)
+loader = DataLoader(
+    subset,
+    batch_size=len(subset),
+    shuffle=False,
+    pin_memory=torch.cuda.is_available(),
+)
 imgs, labels = next(iter(loader))
-imgs = imgs.to(device, non_blocking=True)
+imgs = imgs.to(device, non_blocking=True).float()
 labels = labels.to(device, non_blocking=True)
 
 n = imgs.shape[0]
@@ -36,79 +41,87 @@ X = imgs.view(n, d)
 
 # y in {-1, +1}
 y = torch.where(
-    labels == 0, torch.tensor(-1.0, device=device), torch.tensor(1.0, device=device)
+    labels == 0,
+    -torch.ones_like(labels, dtype=torch.float32),
+    torch.ones_like(labels, dtype=torch.float32),
 )
+y = y.to(device)
 
-# precompute once for speed
 X_T = X.t()  # (d, n)
 
-# ---------------------- core ops ---------------------- #
-
-
-@torch.no_grad()
-def gd_step(v, X, X_T, y, eta):
-    # logits = X @ v
-    logits = X.mv(v)  # (n,)
-    # s = 1 / (1 + exp(y * logits))
-    s = torch.sigmoid(-y * logits)  # numerically stable
-    # gradient: g = -(1/n) X^T (y * s)
-    g = -(X_T.mv(y * s)) / X.shape[0]  # (d,)
-    v.add_(g, alpha=-eta)  # in-place: v = v - eta * g
-
-
-@torch.no_grad()
-def accuracy(v, X, y):
-    logits = X.mv(v)
-    preds = torch.sign(logits)
-    return (preds == y).float().mean().item()
-
-
-# ---------------------- training loop ---------------------- #
+# ---------------------- batched training over step sizes ---------------------- #
 
 step_sizes = [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0]
-T = 300000
+etas = torch.tensor(step_sizes, device=device, dtype=torch.float32).view(-1, 1)  # (m,1)
+m = etas.shape[0]
+
+T = 300_000
 eval_every = 1000
 
-histories = {}
+# V has one row per step size
+V = torch.zeros(m, d, device=device)
 
-for eta in step_sizes:
-    print(f"\n=== Step size {eta} ===")
-    v = torch.zeros(d, device=device)
-    acc_list = []
-    iter_list = []
+# history buffers
+iter_list = []
+acc_lists = {eta: [] for eta in step_sizes}
 
-    for t in range(T + 1):
-        # evaluate accuracy
-        if t % eval_every == 0:
-            with torch.no_grad():
-                logits = X @ v
-                preds = torch.sign(logits)
-                correct = (preds == y).float().mean().item()
-                acc_list.append(correct)
-                iter_list.append(t)
-                print(f"[eta={eta}] iter {t}/{T}  acc={correct:.4f}")
 
-        # full-batch GD step
-        gd_step(v, X, X_T, y, eta)
+@torch.no_grad()
+def batched_accuracy(V, X, y):
+    # logits: (n,m)
+    logits = X @ V.t()
+    preds = torch.where(logits >= 0, torch.ones_like(logits), -torch.ones_like(logits))
+    accs = (preds == y.view(-1, 1)).float().mean(dim=0)  # (m,)
+    return accs
 
-    histories[eta] = (iter_list, acc_list)
 
-# ---------------------- plotting ---------------------- #
+@torch.no_grad()
+def batched_gd_step(V, X, X_T, y, etas):
+    # logits: (n,m)
+    logits = X @ V.t()
+    # s = sigmoid(-y*logits): (n,m)
+    s = torch.sigmoid(-y.view(-1, 1) * logits)
+    # tmp = y*s: (n,m)
+    tmp = y.view(-1, 1) * s
+    # g: (d,m) = -(1/n) X^T tmp
+    g = -(X_T @ tmp) / X.shape[0]
+    # V = V - etas * g^T  (etas is (m,1), g^T is (m,d))
+    V.add_(g.t() * (-etas))
+
+
+print(f"Training {m} step sizes in parallel on {device} ...")
+
+for t in range(T + 1):
+    if t % eval_every == 0:
+        accs = batched_accuracy(V, X, y).detach().cpu().tolist()
+        iter_list.append(t)
+        line = [f"iter {t}/{T}"]
+        for j, eta in enumerate(step_sizes):
+            acc = accs[j]
+            acc_lists[eta].append(acc)
+            line.append(f"eta={eta:g} acc={acc:.4f}")
+        print("  ".join(line))
+
+    if t < T:
+        batched_gd_step(V, X, X_T, y, etas)
+
+histories = {eta: (iter_list, acc_lists[eta]) for eta in step_sizes}
+
+# ---------------------- plotting + saving ---------------------- #
 
 os.makedirs("results", exist_ok=True)
 history_path = "results/linear_histories.pt"
-
 torch.save(histories, history_path)
 print(f"Saved histories to {history_path}")
 
 plt.figure(figsize=(7, 4))
 for eta in step_sizes:
     it, acc = histories[eta]
-    plt.plot(it, acc, label=f"Linear model step {eta}")
+    plt.plot(it, acc, label=f"Linear model step {eta:g}")
 
 plt.xlabel("Iteration")
 plt.ylabel("Accuracy")
-plt.ylim(0.7, 1.01)
+plt.ylim(0.0, 1.01)
 plt.legend()
 plt.tight_layout()
 plt.show()
