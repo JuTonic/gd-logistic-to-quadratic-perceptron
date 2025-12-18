@@ -55,7 +55,7 @@ step_sizes = [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0]
 etas = torch.tensor(step_sizes, device=device, dtype=torch.float32).view(-1, 1)  # (m,1)
 m = etas.shape[0]
 
-T = 300_000
+T = 400_000
 eval_every = 1000
 
 # V has one row per step size
