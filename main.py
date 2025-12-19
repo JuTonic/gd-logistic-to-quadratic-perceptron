@@ -1,4 +1,6 @@
 import os
+
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 import random
 
 import matplotlib.pyplot as plt
@@ -86,8 +88,10 @@ step_sizes = [1e-3, 1e-2, 1e-1, 1.0, 10.0, 100.0]
 etas = torch.tensor(step_sizes, device=device, dtype=dtype).view(-1, 1)  # (m,1)
 m = etas.shape[0]
 
-T = 400_000
-eval_every = 1000
+T = 3_500_000
+save_every = 100  # save to history for plotting
+print_every = 1_0000  # print to console
+EPS = 1e-12
 
 V = torch.zeros(m, d, device=device, dtype=dtype)  # one row per eta
 
@@ -108,33 +112,37 @@ def batched_gd_step(V, X, X_T, y, etas):
     logits = X @ V.t()  # (n,m)
     s = torch.sigmoid(-y.view(-1, 1) * logits)  # (n,m)
     tmp = y.view(-1, 1) * s  # (n,m)
-    g = -(X_T @ tmp) / X.shape[0]  # (d,m)
-    V.add_(g.t(), alpha=-1.0)  # V <- V - g^T
-    V.add_(g.t() * 0.0)  # no-op; keep as placeholder to show no extra coupling
-    V.add_(g.t() * (-etas + etas))  # no-op; ensure broadcasting sanity
-    V.add_(g.t() * (-etas))  # V <- V - etas * g^T
+    g = -(X_T @ tmp) / X.shape[0]  # (d,m) = grad columns
+    V.add_(g.t() * (-etas))  # V <- V - etas * grad^T
 
 
 print(f"Subset size n={n}, dimension d={d}, device={device}, SCALE={SCALE}")
 
 for t in range(T + 1):
-    if t % eval_every == 0:
-        accs = batched_accuracy(V, X, y).detach().cpu().tolist()
-        iter_list.append(t)
 
-        parts = [f"iter {t}/{T}"]
+    # save accuracies every 10 steps
+    if t % save_every == 0:
+        accs_t = batched_accuracy(V, X, y)  # (m,) tensor on device
+        accs = accs_t.detach().cpu().tolist()  # python floats
+
+        iter_list.append(t)
         for j, eta in enumerate(step_sizes):
-            acc = accs[j]
-            acc_lists[eta].append(acc)
-            parts.append(f"eta={eta:g} acc={acc:.4f}")
-        print("  ".join(parts))
+            acc_lists[eta].append(accs[j])
+
+        # print only every 10000 steps (reusing same computed accs)
+        if t % print_every == 0:
+            parts = [f"iter {t}/{T}"]
+            for j, eta in enumerate(step_sizes):
+                parts.append(f"eta={eta:g} acc={accs[j]:.4f}")
+            print("  ".join(parts))
 
         # early stop if any eta reaches 100%
-        if max(accs) >= 1.0:
-            print("Reached 100% training accuracy for at least one step size.")
-            # keep going if you want full curves; otherwise break
-            # break
+        # if float(accs_t.max().item()) >= 1.0 - EPS:
+        # best_j = int(torch.argmax(accs_t).item())
+        # print(f"Stopping: eta={step_sizes[best_j]:g} reached 1.0 acc at iter={t}.")
+        # break
 
+    # GD step (skip if we broke at t==T, but harmless either way)
     if t < T:
         batched_gd_step(V, X, X_T, y, etas)
 
