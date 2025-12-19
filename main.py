@@ -69,7 +69,7 @@ labels = labels.to(device=device, non_blocking=True)
 
 # Optional: if you want to test different scaling, toggle this.
 # Using scale=255 changes the effective learning rates dramatically.
-SCALE = 1.0
+SCALE = 255
 imgs = imgs * SCALE
 
 n = imgs.shape[0]

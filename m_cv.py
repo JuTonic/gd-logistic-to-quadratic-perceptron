@@ -1,20 +1,18 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
 import os
-
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
-
 import random
+
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
-import matplotlib.pyplot as plt
 
-
-# ---------------------- determinism ---------------------- #
+# ====================== determinism ====================== #
 SEED = 0
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = (
+    ":4096:8"  # needed for deterministic matmul on CUDA
+)
+
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
@@ -29,22 +27,19 @@ torch.use_deterministic_algorithms(True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 dtype = torch.float32
 
-
-# ---------------------- data ---------------------- #
-# NOTE: ToTensor maps uint8 [0..255] -> float [0..1]
+# ====================== data: CIFAR10 classes {0,1} ====================== #
 transform = transforms.ToTensor()
 trainset = datasets.CIFAR10(
     root="./data", train=True, download=True, transform=transform
 )
 
-targets = np.array(trainset.targets)
+targets = np.asarray(trainset.targets)
 idx0 = np.where(targets == 0)[0]
 idx1 = np.where(targets == 1)[0]
 
 os.makedirs("results", exist_ok=True)
 idx_path = "results/cifar10_cls01_idx_seed0.npy"
 
-# Save indices so the subset is exactly repeatable across runs
 if os.path.exists(idx_path):
     indices = np.load(idx_path)
 else:
@@ -63,11 +58,12 @@ loader = DataLoader(
     pin_memory=torch.cuda.is_available(),
     num_workers=0,
 )
-imgs, labels = next(iter(loader))
 
+imgs, labels = next(iter(loader))
 imgs = imgs.to(device=device, non_blocking=True, dtype=dtype)
 labels = labels.to(device=device, non_blocking=True)
 
+# ToTensor already scales to [0,1]. Keep SCALE=1.0 to match that.
 SCALE = 1.0
 imgs = imgs * SCALE
 
@@ -75,121 +71,115 @@ n = imgs.shape[0]
 X = imgs.reshape(n, -1).contiguous()  # (n,d)
 d = X.shape[1]
 
-# y in {-1, +1}
+# y in {-1,+1}
 y = torch.where(
     labels == 0,
-    torch.tensor(-1.0, device=device),
-    torch.tensor(1.0, device=device),
-).to(dtype)
+    -torch.ones_like(labels, dtype=dtype),
+    torch.ones_like(labels, dtype=dtype),
+).to(device)
 
-# For k=2 convolution with circular shift P: (c*b) = c1*b + c2*(P b)
-X_shift = X.roll(shifts=1, dims=1).contiguous()
+# "P" operator for k=2 circular convolution: one-step circular shift
+X_shift = torch.roll(X, shifts=1, dims=1).contiguous()
 
 X_T = X.t().contiguous()
 X_shift_T = X_shift.t().contiguous()
 
+print(f"Subset n={n}, d={d}, device={device}, dtype={dtype}, SCALE={SCALE}")
 
-# ---------------------- m_cv training ---------------------- #
-# "Suitable" step sizes for k=2 (Conv2Linear) used in the paper's CIFAR-10 experiment:
-# 2^0, 2^-1, ..., 2^-6
-step_sizes = [1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625]
-
-# Optional: if you want to try slightly smaller too
-# step_sizes += [0.0078125, 0.00390625]
-
+# ====================== m_cv model + GD (parallel over step sizes) ====================== #
+# Paper Fig 1(b): gamma in {2^-6, ..., 2^0}
+step_sizes = [2.0 ** (-p) for p in range(9, 3, -1)]  # 2^-6 .. 2^0
 etas = torch.tensor(step_sizes, device=device, dtype=dtype).view(-1, 1)  # (m,1)
-m = etas.shape[0]
+m = len(step_sizes)
 
-T = 400_000
-save_every = 100
+T = 500_000
+save_every = 1
 print_every = 10_000
-EPS = 1e-12
 
-# Parameters per eta:
-# C: (m,2) for kernel c=[c1,c2], V: (m,d) for v
-C = torch.ones(m, 2, device=device, dtype=dtype)  # start at [1,1]
-V = torch.zeros(m, d, device=device, dtype=dtype)  # start at 0
+# IMPORTANT: nonzero init; otherwise bilinear model can get stuck at all-zeros
+init_scale = 1e-2
+C = init_scale * torch.randn(m, 2, device=device, dtype=dtype)  # kernels (c0,c1)
+V = init_scale * torch.randn(m, d, device=device, dtype=dtype)  # weights
 
 
 @torch.no_grad()
-def batched_accuracy_mcv(C, V, X, X_shift, y):
-    a1 = X @ V.t()  # (n,m)
-    a2 = X_shift @ V.t()  # (n,m)
-    logits = a1 * C[:, 0].view(1, -1) + a2 * C[:, 1].view(1, -1)
+def mcv_logits(X, X_shift, V, C):
+    # A_j = <x, v_j>, B_j = <Px, v_j>, logits = c0*A + c1*B
+    A = X @ V.t()  # (n,m)
+    B = X_shift @ V.t()  # (n,m)
+    c0 = C[:, 0].view(1, -1)  # (1,m)
+    c1 = C[:, 1].view(1, -1)
+    return A * c0 + B * c1, A, B
 
-    preds = torch.sign(logits)
-    preds[preds == 0] = 1
+
+@torch.no_grad()
+def batched_accuracy_from_logits(logits, y):
+    preds = torch.where(logits >= 0, torch.ones_like(logits), -torch.ones_like(logits))
     return (preds == y.view(-1, 1)).float().mean(dim=0)  # (m,)
 
 
 @torch.no_grad()
-def batched_gd_step_mcv(C, V, X, X_T, X_shift, X_shift_T, y, etas):
-    a1 = X @ V.t()  # (n,m)
-    a2 = X_shift @ V.t()  # (n,m)
-    logits = a1 * C[:, 0].view(1, -1) + a2 * C[:, 1].view(1, -1)
+def mcv_batched_gd_step(X, X_T, X_shift, X_shift_T, y, V, C, etas):
+    # forward
+    logits, A, B = mcv_logits(X, X_shift, V, C)  # (n,m), (n,m), (n,m)
 
-    s = torch.sigmoid(-y.view(-1, 1) * logits)  # (n,m)
-    ys = y.view(-1, 1) * s  # (n,m)
-    n = X.shape[0]
+    # dL/dlogits = -(y * sigmoid(-y*logits)) / n
+    ycol = y.view(-1, 1)
+    dl = -(ycol * torch.sigmoid(-ycol * logits)) / X.shape[0]  # (n,m)
 
-    # grad wrt c1,c2
-    g_c1 = -(ys * a1).mean(dim=0)  # (m,)
-    g_c2 = -(ys * a2).mean(dim=0)  # (m,)
+    # grads for C: gC0 = sum dl*A, gC1 = sum dl*B  (already includes /n)
+    gC0 = (dl * A).sum(dim=0)  # (m,)
+    gC1 = (dl * B).sum(dim=0)  # (m,)
+    gC = torch.stack([gC0, gC1], dim=1)  # (m,2)
 
-    # grad wrt v
-    tmp1 = ys * C[:, 0].view(1, -1)  # (n,m)
-    tmp2 = ys * C[:, 1].view(1, -1)  # (n,m)
-    g_v = -((X_T @ tmp1) + (X_shift_T @ tmp2)).t() / n  # (m,d)
+    # grads for V:
+    # gV^T = X^T (dl*c0) + X_shift^T (dl*c1)
+    c0 = C[:, 0].view(1, -1)  # (1,m)
+    c1 = C[:, 1].view(1, -1)
+    term1 = X_T @ (dl * c0)  # (d,m)
+    term2 = X_shift_T @ (dl * c1)  # (d,m)
+    gV = (term1 + term2).t().contiguous()  # (m,d)
 
-    # GD updates
-    C[:, 0].add_(g_c1 * (-etas.view(-1)))
-    C[:, 1].add_(g_c2 * (-etas.view(-1)))
-    V.add_(g_v * (-etas))
+    # updates (one eta per row)
+    V.add_(gV * (-etas))  # V -= eta * gV
+    C.add_(gC * (-etas))  # C -= eta * gC
 
 
-print(f"m_cv (k=2) | n={n}, d={d}, device={device}, SCALE={SCALE}, etas={step_sizes}")
-
+# ====================== train + log ====================== #
 iter_list = []
 acc_lists = {eta: [] for eta in step_sizes}
 
 for t in range(T + 1):
     if t % save_every == 0:
-        acc_t = batched_accuracy_mcv(C, V, X, X_shift, y)
-        acc = acc_t.detach().cpu().tolist()
+        logits, _, _ = mcv_logits(X, X_shift, V, C)
+        accs_t = batched_accuracy_from_logits(logits, y)
+        accs = accs_t.detach().cpu().tolist()
 
         iter_list.append(t)
         for j, eta in enumerate(step_sizes):
-            acc_lists[eta].append(acc[j])
+            acc_lists[eta].append(accs[j])
 
         if t % print_every == 0:
             parts = [f"iter {t}/{T}"]
-            for j, eta in enumerate(step_sizes):
-                parts.append(f"eta={eta:g} acc={acc[j]:.4f}")
+            parts += [f"eta={step_sizes[j]:g} acc={accs[j]:.4f}" for j in range(m)]
             print("  ".join(parts))
 
-        # early stop if any eta reaches 100%
-        if float(acc_t.max().item()) >= 1.0 - EPS:
-            best_j = int(torch.argmax(acc_t).item())
-            print(f"Stopping: eta={step_sizes[best_j]:g} reached 1.0 acc at iter={t}.")
-            break
-
     if t < T:
-        batched_gd_step_mcv(C, V, X, X_T, X_shift, X_shift_T, y, etas)
+        mcv_batched_gd_step(X, X_T, X_shift, X_shift_T, y, V, C, etas)
 
 histories = {eta: (iter_list, acc_lists[eta]) for eta in step_sizes}
-torch.save(histories, "results/mcv_k2_histories.pt")
-torch.save({"C": C.detach().cpu(), "V": V.detach().cpu()}, "results/mcv_k2_params.pt")
-print(
-    "Saved histories to results/mcv_k2_histories.pt and params to results/mcv_k2_params.pt"
-)
+out_path = "results/mcv_histories.pt"
+torch.save(histories, out_path)
+print(f"Saved histories to {out_path}")
 
+# ====================== plot ====================== #
 plt.figure(figsize=(7, 4))
 for eta in step_sizes:
     it, acc = histories[eta]
-    plt.plot(it, acc, label=f"m_cv step {eta:g}")
+    plt.plot(it, acc, label=f"m_cv η={eta:g}")
 plt.xlabel("Iteration")
 plt.ylabel("Accuracy")
-plt.ylim(0.7, 1.01)
+plt.ylim(0.0, 1.01)
 plt.legend()
 plt.tight_layout()
 plt.show()
